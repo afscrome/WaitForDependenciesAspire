@@ -1,8 +1,13 @@
 var builder = DistributedApplication.CreateBuilder(args);
 
-var db = builder.AddSqlServer("sql")
-    .WithHealthCheck()
-    .AddDatabase("db");
+var sql = builder.AddSqlServer("sql")
+    .WithHealthCheck();
+
+var dbMigrator = builder.AddProject<Projects.ConsoleApp1>("dbMigrator")
+    .WaitFor(sql);
+
+var db = sql.AddDatabase("db")
+    .WaitForCompletion(dbMigrator);
 
 var rabbit = builder.AddRabbitMQ("rabbit")
                     .WithHealthCheck();
@@ -19,6 +24,9 @@ builder.AddProject<Projects.WebApplication1>("api")
     .WaitFor(db)
     .WaitFor(rabbit)
     .WaitFor(api0)
-    .WaitForCompletion(console);
+    .WaitForCompletion(console)
+    ;
+
+var failToStart = builder.AddExecutable("failToStart", "DoesNotExist.exe", ".");
 
 builder.Build().Run();

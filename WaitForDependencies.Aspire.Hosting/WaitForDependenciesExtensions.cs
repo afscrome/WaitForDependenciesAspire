@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+﻿using System.Collections.Frozen;
 using System.Runtime.ExceptionServices;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Lifecycle;
@@ -21,7 +21,7 @@ public static class WaitForDependenciesExtensions
         where T : IResource
     {
         builder.ApplicationBuilder.AddWaitForDependencies();
-        return builder.WithAnnotation(new WaitOnAnnotation(other.Resource));
+        return builder.WithAnnotation(new WaitForAnnotation(other.Resource));
     }
 
     /// <summary>
@@ -34,7 +34,7 @@ public static class WaitForDependenciesExtensions
         where T : IResource
     {
         builder.ApplicationBuilder.AddWaitForDependencies();
-        return builder.WithAnnotation(new WaitOnAnnotation(other.Resource) { WaitUntilCompleted = true });
+        return builder.WithAnnotation(new WaitForAnnotation(other.Resource) { WaitUntilCompleted = true });
     }
 
     /// <summary>
@@ -48,7 +48,7 @@ public static class WaitForDependenciesExtensions
         return builder;
     }
 
-    private class WaitOnAnnotation(IResource resource) : IResourceAnnotation
+    private class WaitForAnnotation(IResource resource) : IResourceAnnotation
     {
         public IResource Resource { get; } = resource;
 
@@ -58,7 +58,9 @@ public static class WaitForDependenciesExtensions
     }
 
     private class WaitForDependenciesRunningHook(DistributedApplicationExecutionContext executionContext,
-        ResourceNotificationService resourceNotificationService) :
+        ResourceNotificationService resourceNotificationService,
+        ResourceLoggerService loggerService,
+        ILogger<WaitForDependenciesRunningHook> logger) :
         IDistributedApplicationLifecycleHook,
         IAsyncDisposable
     {
@@ -72,163 +74,138 @@ public static class WaitForDependenciesExtensions
                 return Task.CompletedTask;
             }
 
-            // The global list of resources being waited on
-            var waitingResources = new ConcurrentDictionary<IResource, ConcurrentDictionary<WaitOnAnnotation, TaskCompletionSource>>();
+            var progress = appModel.Resources.ToFrozenDictionary(x => x, x => new ResourceProgress(x, resourceNotificationService, cancellationToken));
 
             // For each resource, add an environment callback that waits for dependencies to be running
-            foreach (var r in appModel.Resources)
+            foreach (var resource in appModel.Resources)
             {
-                var resourcesToWaitOn = r.Annotations.OfType<WaitOnAnnotation>().ToLookup(a => a.Resource);
-
-                if (resourcesToWaitOn.Count == 0)
-                {
-                    continue;
-                }
+                var resourceProgress = progress[resource];
 
                 // Abuse the environment callback to wait for dependencies to be running
-
-                r.Annotations.Add(new EnvironmentCallbackAnnotation(async context =>
+                resource.Annotations.Add(new EnvironmentCallbackAnnotation(async context =>
                 {
-                    var dependencies = new List<Task>();
-
-                    // Find connection strings and endpoint references and get the resource they point to
-                    foreach (var group in resourcesToWaitOn)
-                    {
-                        var resource = group.Key;
-
-                        // REVIEW: This logic does not handle cycles in the dependency graph (that would result in a deadlock)
-
-                        // Don't wait for yourself
-                        if (resource != r && resource is not null)
-                        {
-                            var pendingAnnotations = waitingResources.GetOrAdd(resource, _ => new());
-
-                            foreach (var waitOn in group)
-                            {
-                                var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-                                async Task Wait()
-                                {
-                                    context.Logger?.LogInformation("Waiting for {Resource}.", waitOn.Resource.Name);
-
-                                    await tcs.Task;
-
-                                    context.Logger?.LogInformation("Waiting for {Resource} completed.", waitOn.Resource.Name);
-                                }
-
-                                pendingAnnotations[waitOn] = tcs;
-
-                                dependencies.Add(Wait());
-                            }
-                        }
-                    }
-
-                    await resourceNotificationService.PublishUpdateAsync(r, s => s with
-                    {
-                        State = new("Waiting", KnownResourceStateStyles.Info)
-                    });
-                    
-                    await Task.WhenAll(dependencies).WaitAsync(context.CancellationToken);
+                    await resourceProgress.DependenciesReady.Task;
                 }));
+
+                _ = TrackResourceDependencies(resourceProgress, cancellationToken);
+                _ = TrackResourceHealth(resourceProgress, cancellationToken);
+                _ = ReportResourceState(resourceProgress, cancellationToken);
             }
-
-            _ = Task.Run(async () =>
-           {
-               var stoppingToken = _cts.Token;
-
-               // These states are terminal but we need a better way to detect that
-               static bool IsKnownTerminalState(CustomResourceSnapshot snapshot) =>
-                   snapshot.State == "FailedToStart" ||
-                   snapshot.State == "Exited" ||
-                   snapshot.ExitCode is not null;
-
-               // Watch for global resource state changes
-               await foreach (var resourceEvent in resourceNotificationService.WatchAsync(stoppingToken))
-               {
-                   if (waitingResources.TryGetValue(resourceEvent.Resource, out var pendingAnnotations))
-                   {
-                       foreach (var (waitOn, tcs) in pendingAnnotations)
-                       {
-                           if (waitOn.States is string[] states && states.Contains(resourceEvent.Snapshot.State?.Text, StringComparer.Ordinal))
-                           {
-                               pendingAnnotations.TryRemove(waitOn, out _);
-
-                               _ = DoTheHealthCheck(resourceEvent, tcs);
-                           }
-                           else if (waitOn.WaitUntilCompleted)
-                           {
-                               if (IsKnownTerminalState(resourceEvent.Snapshot))
-                               {
-                                   pendingAnnotations.TryRemove(waitOn, out _);
-
-                                   _ = DoTheHealthCheck(resourceEvent, tcs);
-                               }
-                           }
-                           else if (waitOn.States is null)
-                           {
-                               if (resourceEvent.Snapshot.State == "Running")
-                               {
-                                   pendingAnnotations.TryRemove(waitOn, out _);
-
-                                   _ = DoTheHealthCheck(resourceEvent, tcs);
-                               }
-                               else if (IsKnownTerminalState(resourceEvent.Snapshot))
-                               {
-                                   pendingAnnotations.TryRemove(waitOn, out _);
-
-                                   tcs.TrySetException(new Exception($"Dependency {waitOn.Resource.Name} failed to start"));
-                               }
-                           }
-                       }
-                   }
-               }
-           },
-           cancellationToken);
 
             return Task.CompletedTask;
-        }
 
-        private async Task DoTheHealthCheck(ResourceEvent resourceEvent, TaskCompletionSource tcs)
-        {
-            var resource = resourceEvent.Resource;
-
-            // REVIEW: Right now, every resource does an independent health check, we could instead cache
-            // the health check result and reuse it for all resources that depend on the same resource
-
-
-            HealthCheckAnnotation? healthCheckAnnotation = null;
-
-            // Find the relevant health check annotation. If the resource has a parent, walk up the tree
-            // until we find the health check annotation.
-            while (true)
+            async Task TrackResourceDependencies(ResourceProgress resourceProgress, CancellationToken cancellationToken)
             {
-                // If we find a health check annotation, break out of the loop
-                if (resource.TryGetLastAnnotation(out healthCheckAnnotation))
+                var resource = resourceProgress.Resource;
+                var waitTasks = new List<Task>();
+
+                if (resource is IResourceWithParent resourceWithParent)
                 {
-                    break;
+                    waitTasks.Add(WaitforDependencyToBeHealthy(resourceWithParent.Parent));
                 }
 
-                // If the resource has a parent, walk up the tree
-                if (resource is IResourceWithParent parent)
+                if (resource.TryGetAnnotationsOfType<WaitForAnnotation>(out var waitOnAnnotations))
                 {
-                    resource = parent.Parent;
+                    foreach (var waitOn in waitOnAnnotations)
+                    {
+                        var dependency = waitOn.Resource;
+                        waitTasks.Add(waitOn switch
+                        {
+                            { States: { } states } => WaitForDependencyToBeInState(dependency, states),
+                            { WaitUntilCompleted: true } => WaitForDependencyToComplete(dependency),
+                            _ => WaitforDependencyToBeHealthy(dependency)
+                        });
+                    }
                 }
-                else
+
+                if (waitTasks.Count == 0)
                 {
-                    break;
+                    resourceProgress.DependenciesReady.SetResult();
+                    return;
                 }
-            }
-
-            Func<CancellationToken, ValueTask>? operation = null;
-
-            if (healthCheckAnnotation?.HealthCheckFactory is { } factory)
-            {
-                IHealthCheck? check;
 
                 try
                 {
-                    // TODO: Do need to pass a cancellation token here?
-                    check = await factory(resource, default);
+                    await Task.WhenAll(waitTasks)
+                            .WaitAsync(cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    resourceProgress.DependenciesReady.SetException(ex);
+                }
+
+                resourceProgress.DependenciesReady.SetResult();
+
+                async Task WaitforDependencyToBeHealthy(IResource dependency)
+                {
+                    loggerService.GetLogger(resource).LogInformation("⌛ Waiting for {Resource} to be Healthy", dependency.Name);
+                    try
+                    {
+                        await progress[dependency].Healthy.Task;
+                        loggerService.GetLogger(resource).LogInformation("✅ {Resource} is ready", dependency.Name);
+                    }
+                    catch (Exception ex)
+                    {
+                        loggerService.GetLogger(resource).LogError(ex, "Dependency {Resource} failed to become Healthy", dependency.Name);
+                        throw;
+                    }
+                }
+
+                async Task WaitForDependencyToComplete(IResource dependency)
+                {
+                    loggerService.GetLogger(resource).LogInformation("⌛ Waiting for {Resource} to complete", dependency.Name);
+                    //TODO: Can this fail?  What would failure measn?
+                    await progress[dependency].Finished;
+                    loggerService.GetLogger(resource).LogInformation("✅ {Resource} is complete", dependency.Name);
+                }
+
+                async Task WaitForDependencyToBeInState(IResource dependency, IEnumerable<string> targetStates)
+                {
+                    loggerService.GetLogger(resource).LogInformation("⌛Waiting for {Resource} to be in state {TargetStates}", dependency.Name, targetStates);
+                    try
+                    {
+                        await resourceNotificationService.WaitForResourceAsync(resource.Name, targetStates);
+                        loggerService.GetLogger(resource).LogInformation("✅ {Resource} is ready", dependency.Name);
+                    }
+                    catch (Exception ex)
+                    {
+                        loggerService.GetLogger(resource).LogError(ex, "Dependency {Resource} failed to reach state {TargetStates}", dependency.Name, targetStates);
+                        throw;
+                    }
+                }
+
+            }
+
+            async Task TrackResourceHealth(ResourceProgress resourceProgress, CancellationToken cancellationToken)
+            {
+                var resource = resourceProgress.Resource;
+
+                // DependenciesReady and Started state may occur in any order:
+                // - Resources with EnvironmentCallbackAnnotation are guaranteed to go DependenciesReady --> Started
+                // - Resources without this can have DependenciesReady and Started happen in any order
+                var healthcheckBlockers = Task.WhenAll(
+                        resourceProgress.DependenciesReady.Task,
+                        resourceProgress.Started
+                    )
+                    .WaitAsync(cancellationToken); ;
+
+                var firstCompletedTask = await Task.WhenAny(
+                    resourceProgress.Finished,
+                    healthcheckBlockers
+                    );
+
+                if (firstCompletedTask == resourceProgress.Finished)
+                {
+                    resourceProgress.Healthy.SetCanceled();
+                    return;
+                }
+
+                resource.TryGetLastAnnotation<HealthCheckAnnotation>(out var healthCheckAnnotation);
+                Func<CancellationToken, ValueTask>? operation = null;
+
+                if (healthCheckAnnotation?.HealthCheckFactory is { } factory)
+                {
+                    var check = await factory(resource, cancellationToken);
 
                     if (check is not null)
                     {
@@ -253,43 +230,96 @@ public static class WaitForDependenciesExtensions
                         };
                     }
                 }
-                catch (Exception ex)
-                {
-                    tcs.TrySetException(ex);
 
-                    return;
-                }
-            }
-
-            try
-            {
                 if (operation is not null)
                 {
                     var pipeline = CreateResiliencyPipeline();
 
-                    await pipeline.ExecuteAsync(operation);
+                    logger.LogInformation("Starting Healthcheck for {Resource}", resource.Name);
+                    loggerService.GetLogger(resource).LogInformation("🩺 Starting Healthcheck");
+                    try
+                    {
+                        await pipeline.ExecuteAsync(operation, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Healthcheck for {Resource} failed", resource.Name);
+                        loggerService.GetLogger(resource).LogError(ex, "Healthcheck failed");
+
+                        resourceProgress.Healthy.TrySetException(ex);
+
+                        return;
+                    }
+                    logger.LogInformation("{Resource} is healthy", resource.Name);
+                    loggerService.GetLogger(resource).LogInformation("✅ Healthcheck has passed");
+                }
+                resourceProgress.Healthy.SetResult();
+
+                static ResiliencePipeline CreateResiliencyPipeline()
+                {
+                    var retryUntilCancelled = new RetryStrategyOptions()
+                    {
+                        ShouldHandle = new PredicateBuilder().Handle<Exception>(),
+                        BackoffType = DelayBackoffType.Exponential,
+                        MaxRetryAttempts = 5,
+                        UseJitter = true,
+                        MaxDelay = TimeSpan.FromSeconds(30)
+                    };
+
+                    return new ResiliencePipelineBuilder().AddRetry(retryUntilCancelled).Build();
+                }
+            }
+
+            async Task ReportResourceState(ResourceProgress resourceProgress, CancellationToken cancellationToken)
+            {
+                // For resources that go WaitForDependencies -> Started -> Healthy, aspire's default state works well
+                // This ordering is guaranteed for resources with 
+                // Resources that go Started --> WaitForDependencies --> Healthy don't work so well
+                // For such resources, this task adds in a waiting state.
+                var resource = resourceProgress.Resource;
+                await resourceNotificationService.WaitForResourceAsync(resourceProgress.Resource.Name, KnownResourceStates.Running, cancellationToken);
+
+                if (resourceProgress.DependenciesReady.Task.IsCompletedSuccessfully)
+                {
+                    return;
                 }
 
-                tcs.TrySetResult();
-            }
-            catch (Exception ex)
-            {
-                tcs.TrySetException(ex);
-            }
-        }
+                ResourceStateSnapshot? initialState = null;
 
-        private static ResiliencePipeline CreateResiliencyPipeline()
-        {
-            var retryUntilCancelled = new RetryStrategyOptions()
-            {
-                ShouldHandle = new PredicateBuilder().Handle<Exception>(),
-                BackoffType = DelayBackoffType.Exponential,
-                MaxRetryAttempts = 5,
-                UseJitter = true,
-                MaxDelay = TimeSpan.FromSeconds(30)
-            };
+                await resourceNotificationService.PublishUpdateAsync(resource, s =>
+                {
+                    initialState = s.State;
+                    return s with
+                    {
+                        State = new("Waiting", KnownResourceStateStyles.Info)
+                    };
+                });
 
-            return new ResiliencePipelineBuilder().AddRetry(retryUntilCancelled).Build();
+                try
+                {
+                    await resourceProgress.DependenciesReady.Task;
+                }
+                catch (Exception)
+                {
+                    await resourceNotificationService.PublishUpdateAsync(resource, s => s with
+                    {
+                        //TODO: Should we have a dedicated `DependenciesFailedToStart` state?
+                        State = new(KnownResourceStates.FailedToStart, KnownResourceStateStyles.Info)
+                    });
+                    return;
+                }
+
+                if (initialState != null)
+                {
+                    await resourceNotificationService.PublishUpdateAsync(resource, s =>
+                        s.State?.Text != "Waiting"
+                         ? s
+                         : s with
+                         {
+                             State = initialState
+                         });
+                }
+            }
         }
 
         public ValueTask DisposeAsync()
@@ -298,4 +328,47 @@ public static class WaitForDependenciesExtensions
             return default;
         }
     }
+}
+
+internal static class ResourceNotificationServiceExtensions
+{
+    private static readonly string[] _knownTerminalResourceStates = [
+            KnownResourceStates.Exited,
+            KnownResourceStates.FailedToStart,
+            KnownResourceStates.Finished
+        ];
+
+    public static async Task WaitForResourceTerminationAsync(this ResourceNotificationService resourceNotificationService, string resourceName, CancellationToken cancellationToken = default)
+    {
+        //TODO: Get ApplicationStopping token
+        //using var watchCts = CancellationTokenSource.CreateLinkedTokenSource(_applicationStopping, cancellationToken);
+        //var watchToken = watchCts.Token;
+
+        await foreach (var resourceEvent in resourceNotificationService.WatchAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (string.Equals(resourceName, resourceEvent.Resource.Name, StringComparison.OrdinalIgnoreCase)
+                && IsKnownTerminalState(resourceEvent.Snapshot))
+            {
+                return;
+            }
+        }
+
+        throw new OperationCanceledException($"The operation was cancelled before the resource terminated");
+
+        // These states are terminal but we need a better way to detect that
+        static bool IsKnownTerminalState(CustomResourceSnapshot snapshot) =>
+            _knownTerminalResourceStates.Contains(snapshot.State?.Text, StringComparer.OrdinalIgnoreCase)
+            || snapshot.ExitCode is not null;
+    }
+}
+
+internal class ResourceProgress(IResource resource, ResourceNotificationService resourceNotificationService, CancellationToken cancellationToken)
+{
+    public IResource Resource => resource;
+
+    public Task Started { get; } = resourceNotificationService.WaitForResourceAsync(resource.Name, KnownResourceStates.Starting, cancellationToken);
+    public TaskCompletionSource DependenciesReady { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource Healthy { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task Finished { get; } = resourceNotificationService.WaitForResourceTerminationAsync(resource.Name, cancellationToken);
+
 }
